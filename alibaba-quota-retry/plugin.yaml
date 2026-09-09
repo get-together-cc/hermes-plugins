@@ -1,0 +1,5 @@
+name: alibaba-quota-retry
+version: 1.0.0
+description: Reclassify Alibaba 429/insufficient_quota (transient short-window TPM throttling) as rate_limit so Hermes backs off and retries instead of failing the turn.
+provides_hooks:
+  - transform_api_error_classification
