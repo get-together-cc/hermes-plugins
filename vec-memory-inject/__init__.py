@@ -2,15 +2,9 @@
 
 每轮对话前自动执行本地向量记忆搜索 (bge-m3 embeddings + SQLite)，
 把最相关的 top-N 条结果注入当轮用户消息作为上下文。
-同时捕获对话轮次，后台萃取知识点回写知识库 —— 形成
-"检索 → 对话 → 沉淀 → 再检索"的闭环。
 
-数据源: ~/.hermes/vec_memory.db (由 vec_memory.py 维护)
-调用:   python3 <vec-memory-dir>/vec_memory.py search "<query>" 10
-
-脚本路径可用环境变量覆盖:
-  HERMES_VEC_MEMORY_SCRIPT  (默认 ~/.hermes/vec-memory/vec_memory.py)
-  HERMES_EXTRACT_SCRIPT     (默认 ~/.hermes/vec-memory/extract_turn.py)
+数据源: ~/.hermes/vec_memory.db (vec_memory.py 维护)
+调用:   python3 ~/.hermes/vec-memory/vec_memory.py search "<query>" 5
 
 设计约束:
 - 失败静默 (不阻断对话)
@@ -37,18 +31,14 @@ if not logger.handlers:
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(fh)
 
-_SEARCH_SCRIPT = os.environ.get(
-    "HERMES_VEC_MEMORY_SCRIPT",
-    os.path.expanduser("~/.hermes/vec-memory/vec_memory.py"))
-_EXTRACT_SCRIPT = os.environ.get(
-    "HERMES_EXTRACT_SCRIPT",
-    os.path.expanduser("~/.hermes/vec-memory/extract_turn.py"))
+_SEARCH_SCRIPT = "~/.hermes/vec-memory/vec_memory.py"
+_EXTRACT_SCRIPT = "~/.hermes/vec-memory/extract_turn.py"
 _MAX_RESULTS = 5
 _MAX_CHARS = 8000
 
 # ---- 对话捕获配置 ----
 _CAPTURE_DIR = os.path.expanduser("~/.hermes/vec-memory/turns")
-_CAP_USER = 1500       # 用户消息截断 (chars)
+_CAP_USER = 1500      # 用户消息截断 (chars)
 _CAP_ASSISTANT = 3000  # 助手回复截断 (chars)
 
 
@@ -75,7 +65,7 @@ def _parse_output(stdout: str) -> list:
     """Parse vec_memory.py search output into structured hits.
 
     Actual output format:
-        📝 0.685 | 维护库条目摘要 (score | 内容一行)
+        📝 0.685 | project-c/d→详维护库+skill b2b-server/ewc-server
         📁 0.581 | 描述
              → /path/to/file.md
     """
@@ -103,7 +93,7 @@ def _format_context(query: str, hits: list) -> str:
     """Build the injected context block with adaptive filtering.
 
     动态阈值: max(0.45, 最高分×0.75) — 低于阈值丢弃。
-    按分数截断: >0.7 全文, 0.55-0.7 截 100 字, 其余截 50 字。
+    按分数截断: >0.7 全文, 0.5-0.7 截 100 字, 其余截 50 字。
     """
     if not hits:
         return ""
@@ -127,7 +117,7 @@ def _format_context(query: str, hits: list) -> str:
         return text if len(text) <= limit else text[:limit] + "…"
 
     lines = [
-        "【向量记忆自动检索】相关记录:",
+        "【向量记忆自动检索】相关维护库/技能/历史记录:",
         f"检索词: {query}",
         "",
     ]
@@ -145,7 +135,7 @@ def recall_context(session_id, user_message, is_first_turn, conversation_history
     fires this hook, so pure-text turns get extracted too — post_tool_call
     only fires when tools run, which misses chat-only turns).
     """
-    # --- 1. 萃取上一轮 (conversation_history 最后一条 user+assistant) ---
+    # --- 1. 萃取上一轮 (conversation_history 最后一条 assistant 消息) ---
     if conversation_history and os.path.exists(_EXTRACT_SCRIPT):
         try:
             prev_assistant = ""
@@ -178,15 +168,17 @@ def recall_context(session_id, user_message, is_first_turn, conversation_history
 
     hits = _search(query)
     if not hits:
-        return None
+        # 即使无向量记忆命中, 也注入当前时间 (2026-09-09 用户要求)
+        now = datetime.now()
+        return {"context": f"[当前时间: {now.strftime('%Y-%m-%d %A %H:%M (CST)')}]\n"}
 
     context = _format_context(query, hits)
     if len(context) > _MAX_CHARS:
         context = context[:_MAX_CHARS] + "\n...(截断)"
 
-    # 注入当前时间 —— 让模型有时间感知, 问候/时效判断不靠猜
+    # 注入当前时间(2026-09-08 用户要求: 这能让模型有时间感知, 问候/时效判断不再靠猜)
     now = datetime.now()
-    time_tag = f"[当前时间: {now.strftime('%Y-%m-%d %A %H:%M (%Z)')}]\n"
+    time_tag = f"[当前时间: {now.strftime('%Y-%m-%d %A %H:%M (CST)')}]\n"
     context = time_tag + context
 
     logger.info("injected %d hits (%d chars) for query: %s",
@@ -197,9 +189,9 @@ def recall_context(session_id, user_message, is_first_turn, conversation_history
 def capture_turn(session_id, user_message, assistant_response, **kwargs):
     """post_llm_call hook: capture turn AND extract knowledge immediately.
 
-    NOTE: 某些 Hermes 版本 post_llm_call 无触发点 (turn_context.py 只触发
-    pre_llm_call)。本函数在该 hook 生效的版本接管捕获；当前实际触发走
-    _on_post_tool_call (post_tool_call hook) + recall_context 的历史萃取路径。
+    NOTE: Hermes 当前版本 (turn_context.py) 只触发 pre_llm_call，
+    post_llm_call 文档存在但无触发点。本函数保留以便未来版本生效；
+    当前实际触发走 _on_post_tool_call (post_tool_call hook)。
     """
     try:
         os.makedirs(_CAPTURE_DIR, exist_ok=True)
@@ -229,14 +221,14 @@ def capture_turn(session_id, user_message, assistant_response, **kwargs):
     return None  # observer hook — nothing to inject
 
 
-# ---- post_tool_call 补充路径 (按版本生效) ----
-# 状态: task_id(会话) -> 最近萃取时间; 每轮最多萃取一次
+# ---- post_tool_call 替代方案 (当前版本生效路径) ----
+# 状态: (session_id, 最近萃取时间戳) -> 每轮最多萃取一次
 _last_extract: dict = {}
 _EXTRACT_COOLDOWN_S = 90  # 同一会话 90 秒内只萃取一次
 
 
 def _on_post_tool_call(tool_name, args, result, task_id, **kwargs):
-    """post_tool_call hook: 工具调用轮结束后触发萃取。
+    """post_tool_call hook: 每轮对话结束后由工具调用触发萃取。
 
     策略: 用 task_id(会话) + 冷却时间去重，同一轮对话只萃取一次。
     萃取内容取最近一次捕获的 user/assistant 消息。
@@ -251,6 +243,7 @@ def _on_post_tool_call(tool_name, args, result, task_id, **kwargs):
     _last_extract[task_id] = now
 
     try:
+        # 读取最近的捕获条目 (同会话最新一条)
         day = date.today().isoformat()
         path = os.path.join(_CAPTURE_DIR, f"{day}.jsonl")
         if not os.path.exists(path):
@@ -297,12 +290,11 @@ def _run_extract(payload: str) -> None:
 
 
 def register(ctx):
-    """Register hooks: pre_llm_call (inject + 上一轮萃取) + post_tool_call + post_llm_call.
+    """Register hooks: pre_llm_call (inject) + post_tool_call (capture/extract).
 
-    注意: 部分 Hermes 版本 post_llm_call 无触发点 (turn_context.py 只触发
-    pre_llm_call)，所以捕获/萃取挂在 post_tool_call 与 recall_context 的
-    conversation_history 路径上 (90s 冷却去重)。post_llm_call 注册保留，
-    在支持它的版本上自动接管。
+    注意: 当前 Hermes 版本 post_llm_call 无触发点 (turn_context.py 只触发
+    pre_llm_call)，所以捕获/萃取挂在 post_tool_call 上 (90s 冷却去重)。
+    post_llm_call 注册保留，未来版本生效后自动接管。
     """
     ctx.register_hook("pre_llm_call", recall_context)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
