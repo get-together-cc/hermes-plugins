@@ -1,0 +1,6 @@
+name: vec-memory-inject
+version: 1.1.0
+description: 每轮对话自动从本地向量记忆检索相关内容并注入上下文 (RAG)，并捕获对话萃取入知识库
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
